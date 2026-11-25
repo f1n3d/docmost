@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { CreatePageDto, ContentFormat } from '../dto/create-page.dto';
 import { ContentOperation, UpdatePageDto } from '../dto/update-page.dto';
+import { ReplacePageTextDto } from '../dto/replace-page-text.dto';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import {
@@ -463,6 +464,52 @@ export class PageService {
       documentName,
       { operation, prosemirrorJson, user },
     );
+  }
+
+  async replacePageText(
+    page: Page,
+    dto: ReplacePageTextDto,
+    user: User,
+  ): Promise<{ replacements: number }> {
+    const { oldText, newText, replaceAll = false } = dto;
+    if (oldText === newText) {
+      throw new BadRequestException('oldText and newText are the same');
+    }
+
+    const result = await this.collaborationGateway.handleYjsEvent(
+      'replacePageText',
+      `page.${page.id}`,
+      { oldText, newText, replaceAll, user },
+    );
+
+    if (!result?.matches) {
+      throw new BadRequestException(
+        'Text not found. It has to match the plain text of the page, without Markdown syntax, and lie within one block.',
+      );
+    }
+    if (result.addsLineBreak) {
+      throw new BadRequestException(
+        'newText adds a line break. Text can only be replaced within a block, new blocks cannot be added this way.',
+      );
+    }
+    if (!result.replacements) {
+      throw new BadRequestException(
+        `Text found ${result.matches} times. Add surrounding text to make it unique, or set replaceAll.`,
+      );
+    }
+
+    this.generalQueue
+      .add(QueueJob.ADD_PAGE_WATCHERS, {
+        userIds: [user.id],
+        pageId: page.id,
+        spaceId: page.spaceId,
+        workspaceId: page.workspaceId,
+      })
+      .catch((err) =>
+        this.logger.warn(`Failed to queue add-page-watchers: ${err.message}`),
+      );
+
+    return { replacements: result.replacements };
   }
 
   async getSidebarPages(

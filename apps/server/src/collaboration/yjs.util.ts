@@ -3,6 +3,8 @@ import {
   relativePositionToAbsolutePosition,
 } from '@tiptap/y-tiptap';
 import * as Y from 'yjs';
+import { diffWordsWithSpace } from 'diff';
+import { isDeepStrictEqual } from 'node:util';
 import { Document } from '@hocuspocus/server';
 import { getSchema } from '@tiptap/core';
 import { tiptapExtensions } from './collaboration.util';
@@ -11,6 +13,20 @@ export type YjsSelection = {
   anchor: any;
   head: any;
 };
+
+export type YjsTextReplaceResult = {
+  // places where the text was found
+  matches: number;
+  // places that were changed: 0 when the text is missing, ambiguous or refused
+  replacements: number;
+  // refused: the new text would put a line break into a block that is not a code block
+  addsLineBreak?: boolean;
+};
+
+type YjsTextAttributes = Record<string, any>;
+
+// Stands in for a non-text insert, so string offsets stay equal to Yjs offsets.
+const EMBED_PLACEHOLDER = '\uFFFC';
 
 export function setYjsMark(
   doc: Document,
@@ -173,5 +189,200 @@ export function updateYjsMarkAttribute(
 
   for (let i = 0; i < fragment.length; i++) {
     processItem(fragment.get(i));
+  }
+}
+
+/**
+ * Replaces text in place, so the block ids, marks and comment anchors around it are kept.
+ * A match has to lie within one run of text: it cannot cross a block, a mention or a line break.
+ * Nothing is changed when the text is missing, or found more than once without `replaceAll`,
+ * or when the new text adds a line break outside a code block: that would fake a new block.
+ */
+export function replaceYjsText(
+  fragment: Y.XmlFragment,
+  oldText: string,
+  newText: string,
+  replaceAll = false,
+): YjsTextReplaceResult {
+  if (!oldText) return { matches: 0, replacements: 0 };
+
+  const hits: { run: Y.XmlText[]; index: number }[] = [];
+  for (const run of collectTextRuns(fragment)) {
+    const value = run.map(toPlainText).join('');
+    let index = value.indexOf(oldText);
+    while (index !== -1) {
+      hits.push({ run, index });
+      index = value.indexOf(oldText, index + oldText.length);
+    }
+  }
+
+  if (hits.length === 0 || (hits.length > 1 && !replaceAll)) {
+    return { matches: hits.length, replacements: 0 };
+  }
+
+  // Only the words that differ are rewritten, so marks on the rest of a match survive.
+  const hunks = diffHunks(oldText, newText);
+  if (
+    hunks.some(({ insert }) => /[\r\n]/.test(insert)) &&
+    hits.some(({ run }) => !isInCodeBlock(run))
+  ) {
+    return { matches: hits.length, replacements: 0, addsLineBreak: true };
+  }
+  const nonInclusiveMarks = getNonInclusiveMarks();
+
+  // back to front, so earlier offsets in the same run stay valid
+  for (const { run, index } of hits.reverse()) {
+    for (const { from, to, insert } of [...hunks].reverse()) {
+      spliceTextRun(run, index + from, index + to, insert, nonInclusiveMarks);
+    }
+  }
+
+  return { matches: hits.length, replacements: hits.length };
+}
+
+// Adjacent Y.XmlText siblings form one run: content added through the API has one per marked span.
+function collectTextRuns(
+  parent: Y.XmlFragment | Y.XmlElement,
+  runs: Y.XmlText[][] = [],
+): Y.XmlText[][] {
+  let run: Y.XmlText[] = [];
+  for (const child of parent.toArray()) {
+    if (child instanceof Y.XmlText) {
+      run.push(child);
+      continue;
+    }
+    if (run.length) runs.push(run);
+    run = [];
+    if (child instanceof Y.XmlElement) collectTextRuns(child, runs);
+  }
+  if (run.length) runs.push(run);
+  return runs;
+}
+
+function isInCodeBlock(run: Y.XmlText[]): boolean {
+  const parent = run[0].parent;
+  return parent instanceof Y.XmlElement && parent.nodeName === 'codeBlock';
+}
+
+function toPlainText(text: Y.XmlText): string {
+  return text
+    .toDelta()
+    .map((op: any) =>
+      typeof op.insert === 'string' ? op.insert : EMBED_PLACEHOLDER,
+    )
+    .join('');
+}
+
+// The changes that turn `oldText` into `newText`, as offsets into `oldText`.
+function diffHunks(
+  oldText: string,
+  newText: string,
+): { from: number; to: number; insert: string }[] {
+  const hunks: { from: number; to: number; insert: string }[] = [];
+  let offset = 0;
+  let open = false;
+
+  for (const part of diffWordsWithSpace(oldText, newText)) {
+    if (!part.added && !part.removed) {
+      offset += part.value.length;
+      open = false;
+      continue;
+    }
+    if (!open) hunks.push({ from: offset, to: offset, insert: '' });
+    open = true;
+
+    const hunk = hunks[hunks.length - 1];
+    if (part.added) {
+      hunk.insert += part.value;
+    } else {
+      hunk.to += part.value.length;
+      offset += part.value.length;
+    }
+  }
+
+  return hunks;
+}
+
+function getNonInclusiveMarks(): Set<string> {
+  const { marks } = getSchema(tiptapExtensions);
+  return new Set(
+    Object.keys(marks).filter((name) => marks[name].spec.inclusive === false),
+  );
+}
+
+function attributesAt(run: Y.XmlText[], index: number): YjsTextAttributes {
+  let offset = 0;
+  for (const text of run) {
+    if (index >= offset + text.length) {
+      offset += text.length;
+      continue;
+    }
+    for (const op of text.toDelta()) {
+      offset += typeof op.insert === 'string' ? op.insert.length : 1;
+      if (index < offset) return op.attributes ?? {};
+    }
+  }
+  return {};
+}
+
+function runLength(run: Y.XmlText[]): number {
+  return run.reduce((length, text) => length + text.length, 0);
+}
+
+/**
+ * Formatting for text inserted at `from`. Replaced text passes its formatting on.
+ * Added text is formatted as if it were typed there: it takes the marks before it,
+ * but does not extend a mark such as a link or a comment that ends at that position.
+ */
+function insertAttributes(
+  run: Y.XmlText[],
+  from: number,
+  to: number,
+  nonInclusiveMarks: Set<string>,
+): YjsTextAttributes {
+  if (to > from) return { ...attributesAt(run, from) };
+
+  const before = from > 0 ? attributesAt(run, from - 1) : null;
+  const after = from < runLength(run) ? attributesAt(run, from) : null;
+  const main = before ?? after ?? {};
+  const other = before ? after : null;
+
+  const attributes: YjsTextAttributes = {};
+  for (const [name, value] of Object.entries(main)) {
+    // overlapping marks are stored as `name--hash`
+    const markName = name.replace(/--[a-zA-Z0-9+/=]{8}$/, '');
+    const endsHere = !other || !isDeepStrictEqual(other[name], value);
+    if (nonInclusiveMarks.has(markName) && endsHere) continue;
+    attributes[name] = value;
+  }
+  return attributes;
+}
+
+function spliceTextRun(
+  run: Y.XmlText[],
+  from: number,
+  to: number,
+  insert: string,
+  nonInclusiveMarks: Set<string>,
+) {
+  if (from === to && !insert) return;
+
+  const attributes = insertAttributes(run, from, to, nonInclusiveMarks);
+  // the character whose Y.XmlText receives the inserted text
+  const anchor = to > from ? from : Math.max(from - 1, 0);
+
+  let start = 0;
+  for (const text of run) {
+    const end = start + text.length;
+    const removeFrom = Math.max(from, start);
+    const removeTo = Math.min(to, end);
+
+    if (removeTo > removeFrom) {
+      text.delete(removeFrom - start, removeTo - removeFrom);
+    }
+    if (insert && anchor >= start && anchor < end) {
+      text.insert(from - start, insert, attributes);
+    }
+    start = end;
   }
 }

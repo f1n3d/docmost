@@ -15,6 +15,7 @@ import { BacklinkService } from './services/backlink.service';
 import { PageAccessService } from './page-access/page-access.service';
 import { CreatePageDto } from './dto/create-page.dto';
 import { UpdatePageDto } from './dto/update-page.dto';
+import { ReplacePageTextDto } from './dto/replace-page-text.dto';
 import { MovePageDto, MovePageToSpaceDto } from './dto/move-page.dto';
 import {
   DeletePageDto,
@@ -311,6 +312,24 @@ export class PageController {
     }
 
     return { ...updatedPage, permissions };
+  }
+
+  @HttpCode(HttpStatus.OK)
+  @Post('replace-text')
+  @OAuthScope('write')
+  async replaceText(
+    @Body() replacePageTextDto: ReplacePageTextDto,
+    @AuthUser() user: User,
+  ) {
+    const page = await this.pageRepo.findById(replacePageTextDto.pageId);
+
+    if (!page) {
+      throw new NotFoundException('Page not found');
+    }
+
+    await this.pageAccessService.validateCanEdit(page, user);
+
+    return this.pageService.replacePageText(page, replacePageTextDto, user);
   }
 
   @HttpCode(HttpStatus.OK)

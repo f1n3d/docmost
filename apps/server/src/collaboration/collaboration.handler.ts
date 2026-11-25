@@ -5,7 +5,13 @@ import {
   prosemirrorNodeToYElement,
   tiptapExtensions,
 } from './collaboration.util';
-import { setYjsMark, updateYjsMarkAttribute, YjsSelection } from './yjs.util';
+import {
+  replaceYjsText,
+  setYjsMark,
+  updateYjsMarkAttribute,
+  YjsSelection,
+  YjsTextReplaceResult,
+} from './yjs.util';
 import * as Y from 'yjs';
 import { User } from '@docmost/db/types/entity.types';
 
@@ -125,6 +131,29 @@ export class CollaborationHandler {
             }
           },
         );
+      },
+      replacePageText: async (
+        documentName: string,
+        payload: {
+          oldText: string;
+          newText: string;
+          replaceAll: boolean;
+          user: User;
+        },
+      ): Promise<YjsTextReplaceResult> => {
+        const { oldText, newText, replaceAll, user } = payload;
+        this.logger.debug('Replacing page text via yjs', documentName);
+        let result: YjsTextReplaceResult = { matches: 0, replacements: 0 };
+        await this.withYdocConnection(
+          hocuspocus,
+          documentName,
+          { user },
+          (doc) => {
+            const fragment = doc.getXmlFragment('default');
+            result = replaceYjsText(fragment, oldText, newText, replaceAll);
+          },
+        );
+        return result;
       },
     };
   }
